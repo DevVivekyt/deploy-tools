@@ -6,8 +6,6 @@
 #
 # Needs (Settings -> Secrets and variables -> Actions):
 #   CPANEL_TOKEN (secret)   cPanel -> Security -> Manage API Tokens -> Create
-#   DEPLOY_PATH  (secret)   app folder on the server, e.g. /home/geteaseb/crm.geteasebill.xyz
-#   SITE_URL     (variable) address of the site, e.g. https://crm.geteasebill.xyz
 #   PHP_BIN      (variable, optional) e.g. /usr/local/bin/ea-php83 if the database step cannot find PHP
 name: Deploy to live
 
@@ -34,8 +32,8 @@ jobs:
         uses: DevVivekyt/deploy-tools@main
         with:
           cpanel_token: ${{ secrets.CPANEL_TOKEN }}
-          site_url: ${{ vars.SITE_URL }}
-          deploy_path: ${{ secrets.DEPLOY_PATH }}
+          site_url: https://sales.geteasebill.xyz
+          deploy_path: /home/geteaseb/sales.geteasebill.xyz
           php_bin: ${{ vars.PHP_BIN }}
           db_commands: |
             artisan migrate --force

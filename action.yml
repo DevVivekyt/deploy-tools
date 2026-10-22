@@ -37,6 +37,9 @@ inputs:
   runner_folder:
     description: Folder inside deploy_path that the web server serves at <site_url>/<runner_folder>/ ('' = deploy_path itself)
     default: 'public'
+  runner_url:
+    description: Web address of runner_folder, when it is not <site_url>/<runner_folder> (e.g. the domain's document root IS the public folder -> https://school.geteasebill.xyz)
+    default: ''
   cpanel_host:
     default: 'server.dnsfast.in'
   cpanel_user:
@@ -122,6 +125,9 @@ runs:
           -F "file-2=@$RUNNER_TEMP/runner.php;filename=$RUNNER_NAME" \
           "https://$H:2083/execute/Fileman/upload_files") || { echo "::error::Cannot reach https://$H:2083 (cPanel API)"; exit 1; }
         if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "::error::cPanel refused the API token (HTTP $code). Check secret CPANEL_TOKEN and that it belongs to user $U"; exit 1; fi
+        if grep -qi 'One moment, please' "$RUNNER_TEMP/up.json"; then
+          echo "::error::The server's anti-bot protection (Imunify360 / WebShield) blocked GitHub on port 2083. Ask the host to whitelist GitHub Actions IPs (https://api.github.com/meta -> actions) for cPanel port 2083 and the sites."; exit 1
+        fi
         if ! jq -e '.status == 1 and ((.data.failed // 0) == 0)' "$RUNNER_TEMP/up.json" > /dev/null 2>&1; then
           echo "::error::cPanel upload failed (HTTP $code): $(jq -c '.errors // .' "$RUNNER_TEMP/up.json" 2>/dev/null || head -c 500 "$RUNNER_TEMP/up.json")"
           echo "::error::Does the folder $DIR exist on the server?"
@@ -134,13 +140,18 @@ runs:
       env:
         SITE_URL: ${{ inputs.site_url }}
         RF: ${{ inputs.runner_folder }}
+        RURL: ${{ inputs.runner_url }}
       run: |
-        URL="${SITE_URL%/}${RF:+/$RF}/$RUNNER_NAME"
+        BASE="${RURL:-${SITE_URL%/}${RF:+/$RF}}"
+        URL="${BASE%/}/$RUNNER_NAME"
         code=$(curl -sS -o "$RUNNER_TEMP/run.txt" -w '%{http_code}' --max-time 900 -X POST \
           --data-urlencode "token=$DEPLOY_TOKEN" "$URL") || true
+        if grep -qi 'One moment, please' "$RUNNER_TEMP/run.txt"; then
+          echo "::error::The server's anti-bot protection (Imunify360 / WebShield) blocked GitHub on $BASE. Ask the host to whitelist GitHub Actions IPs for this site."; exit 1
+        fi
         cat "$RUNNER_TEMP/run.txt" 2>/dev/null; echo
         if [ "$code" = 404 ] && ! grep -q . "$RUNNER_TEMP/run.txt"; then
-          echo "::error::$URL was not found. The site must serve $RF/ at $SITE_URL/$RF/ (check runner_folder / site_url)"; exit 1
+          echo "::error::$URL was not found. Check runner_folder / runner_url"; exit 1
         fi
         tail -n 1 "$RUNNER_TEMP/run.txt" | grep -q '^DEPLOY OK' || { echo "::error::Deploy did not finish (HTTP $code), see the lines above"; exit 1; }
 

@@ -31,6 +31,7 @@ jobs:
           cpanel_token: ${{ secrets.CPANEL_TOKEN }}
           site_url: https://school.geteasebill.xyz
           deploy_path: /home/geteaseb/school.geteasebill.xyz
+          runner_url: https://school.geteasebill.xyz   # document root is the public/ folder
           php_bin: ${{ vars.PHP_BIN }}
           db_commands: |
             bin/migrate.php
