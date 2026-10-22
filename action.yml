@@ -1,0 +1,164 @@
+name: cPanel deploy (no SSH)
+description: >
+  Uploads the app to a cPanel account through the cPanel API (port 2083) and runs a one-time runner over HTTPS:
+  full database backup -> copy new files (nothing deleted, .env never replaced) -> database commands.
+
+inputs:
+  cpanel_token:
+    description: cPanel API token (cPanel -> Security -> Manage API Tokens). Pass secrets.CPANEL_TOKEN
+    required: true
+  site_url:
+    description: Address of the site, e.g. https://accounts.geteasebill.xyz
+    required: true
+  deploy_path:
+    description: App folder on the server, e.g. /home/geteaseb/accounts.geteasebill.xyz
+    required: true
+  db_commands:
+    description: PHP commands run in the app folder after the files, one per line (without "php"), e.g. database/migrate.php
+    default: ''
+  source:
+    description: Folder in the repo to upload (default the whole repo)
+    default: '.'
+  excludes:
+    description: Extra files/folders never uploaded, one rsync pattern per line, e.g. /tests/
+    default: ''
+  lint:
+    description: Run php -l on every PHP file before deploying
+    default: 'true'
+  php_bin:
+    description: PHP command line program on the server, if plain detection fails (e.g. /usr/local/bin/ea-php83)
+    default: ''
+  env_file:
+    description: Settings file on the server with DB_* values, relative to deploy_path
+    default: '.env'
+  backup_dir:
+    description: Where the pre-deploy database backups are kept, relative to deploy_path
+    default: 'storage/backups'
+  runner_folder:
+    description: Folder inside deploy_path that the web server serves at <site_url>/<runner_folder>/ ('' = deploy_path itself)
+    default: 'public'
+  cpanel_host:
+    default: 'server.dnsfast.in'
+  cpanel_user:
+    default: 'geteaseb'
+
+runs:
+  using: composite
+  steps:
+    - name: Check settings
+      shell: bash
+      env:
+        T: ${{ inputs.cpanel_token }}
+        SITE_URL: ${{ inputs.site_url }}
+        DEPLOY_PATH: ${{ inputs.deploy_path }}
+      run: |
+        [ -n "$T" ] || { echo "::error::Secret CPANEL_TOKEN is missing (Settings -> Secrets and variables -> Actions)"; exit 1; }
+        [ -n "$SITE_URL" ] || { echo "::error::site_url is empty"; exit 1; }
+        [ -n "$DEPLOY_PATH" ] || { echo "::error::deploy_path is empty"; exit 1; }
+        case "$DEPLOY_PATH" in /home/${{ inputs.cpanel_user }}/*) ;; *) echo "::error::deploy_path must be inside /home/${{ inputs.cpanel_user }}/"; exit 1;; esac
+
+    - name: PHP syntax check
+      if: inputs.lint == 'true'
+      shell: bash
+      working-directory: ${{ inputs.source }}
+      run: find . -name '*.php' -not -path '*/vendor/*' -not -path '*/node_modules/*' -not -path '*/android/*' -not -path './.git/*' -print0 | xargs -0 -r -n1 -P4 php -l > /dev/null
+
+    - name: Build the upload package
+      shell: bash
+      env:
+        SRC: ${{ inputs.source }}
+        EXTRA: ${{ inputs.excludes }}
+      run: |
+        PKG="$RUNNER_TEMP/pkg"; rm -rf "$PKG" && mkdir -p "$PKG"
+        printf '%s\n' '.git/' '.github/' '.env' '.env.*' 'node_modules/' '*.zip' '*.apk' '*.aab' '*.jks' '*.keystore' '*.pem' '*.p12' > "$RUNNER_TEMP/excludes"
+        printf '%s\n' "$EXTRA" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' >> "$RUNNER_TEMP/excludes" || true
+        rsync -a --copy-links --exclude-from="$RUNNER_TEMP/excludes" "${SRC%/}/" "$PKG/"
+        (cd "$PKG" && zip -q -r -X "$RUNNER_TEMP/deploy.zip" .)
+        echo "package: $(find "$PKG" -type f | wc -l) files, $(du -h "$RUNNER_TEMP/deploy.zip" | cut -f1) zipped"
+
+    - name: Prepare the one-time runner
+      shell: bash
+      env:
+        DEPLOY_PATH: ${{ inputs.deploy_path }}
+        PHP_BIN: ${{ inputs.php_bin }}
+        DB_COMMANDS: ${{ inputs.db_commands }}
+        ENV_FILE: ${{ inputs.env_file }}
+        BACKUP_DIR: ${{ inputs.backup_dir }}
+      run: |
+        TOKEN=$(openssl rand -hex 32); echo "::add-mask::$TOKEN"
+        ID=$(openssl rand -hex 12)
+        echo "DEPLOY_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        echo "RUNNER_NAME=_deploy-$ID.php" >> "$GITHUB_ENV"
+        echo "ZIP_NAME=.deploy-$ID.zip" >> "$GITHUB_ENV"
+        TOKEN="$TOKEN" ZIP=".deploy-$ID.zip" php -r '
+          $c = ["token_hash" => hash("sha256", getenv("TOKEN")), "zip" => getenv("ZIP"),
+                "app_dir" => rtrim(getenv("DEPLOY_PATH"), "/"), "php_bin" => (string) getenv("PHP_BIN"),
+                "db_commands" => array_values(array_filter(array_map("trim", preg_split("/\R/", (string) getenv("DB_COMMANDS"))))),
+                "env_file" => getenv("ENV_FILE"), "backup_dir" => getenv("BACKUP_DIR")];
+          $src = file_get_contents($argv[1]);
+          $out = preg_replace("#/\*__CFG__\*/\[.*?\];#s", var_export($c, true) . ";", $src, 1, $n);
+          if ($n !== 1) { fwrite(STDERR, "runner template broken\n"); exit(1); }
+          file_put_contents($argv[2], $out);
+          echo "database commands: " . ($c["db_commands"] ? implode(" | ", $c["db_commands"]) : "none") . "\n";
+        ' "$GITHUB_ACTION_PATH/deploy-runner.php" "$RUNNER_TEMP/runner.php"
+        php -l "$RUNNER_TEMP/runner.php" > /dev/null
+
+    - name: Upload through the cPanel API
+      shell: bash
+      env:
+        T: ${{ inputs.cpanel_token }}
+        U: ${{ inputs.cpanel_user }}
+        H: ${{ inputs.cpanel_host }}
+        DEPLOY_PATH: ${{ inputs.deploy_path }}
+        RF: ${{ inputs.runner_folder }}
+      run: |
+        DIR="${DEPLOY_PATH%/}${RF:+/$RF}"
+        REL="${DIR#/home/$U/}"
+        echo "uploading to $DIR"
+        code=$(curl -sS -o "$RUNNER_TEMP/up.json" -w '%{http_code}' --max-time 600 \
+          -H "Authorization: cpanel $U:$T" \
+          -F "dir=$REL" -F "overwrite=1" \
+          -F "file-1=@$RUNNER_TEMP/deploy.zip;filename=$ZIP_NAME" \
+          -F "file-2=@$RUNNER_TEMP/runner.php;filename=$RUNNER_NAME" \
+          "https://$H:2083/execute/Fileman/upload_files") || { echo "::error::Cannot reach https://$H:2083 (cPanel API)"; exit 1; }
+        if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "::error::cPanel refused the API token (HTTP $code). Check secret CPANEL_TOKEN and that it belongs to user $U"; exit 1; fi
+        if ! jq -e '.status == 1 and ((.data.failed // 0) == 0)' "$RUNNER_TEMP/up.json" > /dev/null 2>&1; then
+          echo "::error::cPanel upload failed (HTTP $code): $(jq -c '.errors // .' "$RUNNER_TEMP/up.json" 2>/dev/null || head -c 500 "$RUNNER_TEMP/up.json")"
+          echo "::error::Does the folder $DIR exist on the server?"
+          exit 1
+        fi
+        echo "uploaded"
+
+    - name: Backup database, copy files, update database
+      shell: bash
+      env:
+        SITE_URL: ${{ inputs.site_url }}
+        RF: ${{ inputs.runner_folder }}
+      run: |
+        URL="${SITE_URL%/}${RF:+/$RF}/$RUNNER_NAME"
+        code=$(curl -sS -o "$RUNNER_TEMP/run.txt" -w '%{http_code}' --max-time 900 -X POST \
+          --data-urlencode "token=$DEPLOY_TOKEN" "$URL") || true
+        cat "$RUNNER_TEMP/run.txt" 2>/dev/null; echo
+        if [ "$code" = 404 ] && ! grep -q . "$RUNNER_TEMP/run.txt"; then
+          echo "::error::$URL was not found. The site must serve $RF/ at $SITE_URL/$RF/ (check runner_folder / site_url)"; exit 1
+        fi
+        tail -n 1 "$RUNNER_TEMP/run.txt" | grep -q '^DEPLOY OK' || { echo "::error::Deploy did not finish (HTTP $code), see the lines above"; exit 1; }
+
+    - name: Remove the runner from the server
+      if: always()
+      shell: bash
+      env:
+        T: ${{ inputs.cpanel_token }}
+        U: ${{ inputs.cpanel_user }}
+        H: ${{ inputs.cpanel_host }}
+        DEPLOY_PATH: ${{ inputs.deploy_path }}
+        RF: ${{ inputs.runner_folder }}
+      run: |
+        [ -n "${RUNNER_NAME:-}" ] || exit 0
+        DIR="${DEPLOY_PATH%/}${RF:+/$RF}"
+        curl -sS -o /dev/null --max-time 60 -H "Authorization: cpanel $U:$T" -G \
+          --data-urlencode "cpanel_jsonapi_apiversion=2" --data-urlencode "cpanel_jsonapi_module=Fileman" \
+          --data-urlencode "cpanel_jsonapi_func=fileop" --data-urlencode "op=unlink" \
+          --data-urlencode "sourcefiles=$DIR/$RUNNER_NAME,$DIR/$ZIP_NAME" \
+          "https://$H:2083/json-api/cpanel" || true
+        rm -f "$RUNNER_TEMP/runner.php" "$RUNNER_TEMP/deploy.zip"

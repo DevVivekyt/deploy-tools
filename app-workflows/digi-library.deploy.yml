@@ -1,0 +1,40 @@
+# Deploys digi-library to the live server on every push to `main` (or by hand: Actions -> "Deploy to live" -> Run workflow).
+# Uses the shared action DevVivekyt/deploy-tools: upload through the cPanel API (no SSH, no FTP), then on the server
+#   1. full database backup -> storage/backups/predeploy-<date>.sql.gz (deploy stops if it fails, nothing changed)
+#   2. new files copied over the old ones; nothing on the server is deleted; .env is never replaced
+#   3. the database commands below
+#
+# Needs (Settings -> Secrets and variables -> Actions):
+#   CPANEL_TOKEN (secret)   cPanel -> Security -> Manage API Tokens -> Create
+#   PHP_BIN      (variable, optional) e.g. /usr/local/bin/ea-php83 if the database step cannot find PHP
+name: Deploy to live
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-live
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy
+        uses: DevVivekyt/deploy-tools@main
+        with:
+          cpanel_token: ${{ secrets.CPANEL_TOKEN }}
+          site_url: https://library.geteasebill.xyz
+          deploy_path: /home/geteaseb/library.geteasebill.xyz
+          php_bin: ${{ vars.PHP_BIN }}
+          db_commands: |
+            bin/console migrate
+            database/post_deploy.php
+          excludes: |
+            /tests/
+            phpunit.xml.dist
